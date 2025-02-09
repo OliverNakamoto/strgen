@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@stripe/stripe-js": "^5.2.0",
+    "mapbox-gl": "^3.8.0",
+    "ol-mapbox-style": "^12.3.5",
+    "react-map-gl": "^7.1.7"
+  },
+  "devDependencies": {
+    "@types/react-map-gl": "^6.1.6"
+  }
+}

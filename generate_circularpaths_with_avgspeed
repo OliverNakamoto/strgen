@@ -1,0 +1,291 @@
+import requests
+from lxml import etree
+import datetime
+import random
+import math
+from geopy.distance import geodesic
+from geopy import Point
+
+def fetch_round_trip_route(start_coords, api_key, route_length, num_points=5):
+    """
+    Fetches a round trip route from OpenRouteService API in GPX format.
+    
+    :param start_coords: Tuple of (longitude, latitude)
+    :param api_key: OpenRouteService API key
+    :param route_length: Desired length of the route in meters
+    :param num_points: Number of via points to use in the route
+    :return: GPX data as a string
+    """
+    url = ''
+    headers = {
+        'Authorization': api_key,
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        'coordinates': [list(start_coords)],
+        'options': {
+            'round_trip': {
+                'length': route_length,
+                'points': num_points
+            }
+        },
+        'elevation': True,
+        'instructions': False,
+        'geometry_simplify': False
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code == 200:
+        print('GPX data fetched successfully.')
+        return response.text
+    else:
+        raise Exception(f'Error fetching route: {response.status_code} - {response.text}')
+
+def parse_gpx(gpx_data):
+    """
+    Parses the GPX data to extract coordinates and elevations.
+    
+    :param gpx_data: GPX data as a string
+    :return: List of dictionaries with 'lat', 'lon', 'ele'
+    """
+    # Parse the GPX XML
+    root = etree.fromstring(gpx_data.encode('utf-8'))
+    
+    # Define namespaces
+    namespaces = {
+        'gpx': "http://www.topografix.com/GPX/1/1",
+    }
+    
+    # Find all trkpt elements
+    trkpts = root.findall('.//{*}rtept', namespaces=namespaces)
+
+    
+    points = []
+    for pt in trkpts:
+        lat = pt.get('lat')
+        lon = pt.get('lon')
+        ele_elem = pt.find('gpx:ele', namespaces=namespaces)
+        ele_val = ele_elem.text if ele_elem is not None else '0'
+        
+        # Convert to float
+        try:
+            lat = float(lat)
+            lon = float(lon)
+            ele_val = float(ele_val)
+        except ValueError:
+            print(f"Invalid coordinate or elevation value: lat={lat}, lon={lon}, ele={ele_val}. Skipping point.")
+            continue
+        
+        points.append({'lat': lat, 'lon': lon, 'ele': ele_val})
+    
+    print(f'Parsed {len(points)} track points from GPX data.')
+    return points
+
+def calculate_initial_compass_bearing(pointA, pointB):
+    """
+    Calculates the bearing between two points.
+    
+    :param pointA: tuple of (lat, lon)
+    :param pointB: tuple of (lat, lon)
+    :return: bearing in degrees
+    """
+    lat1 = math.radians(pointA[0])
+    lat2 = math.radians(pointB[0])
+    diffLong = math.radians(pointB[1] - pointA[1])
+
+    x = math.sin(diffLong) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1)
+            * math.cos(lat2) * math.cos(diffLong))
+
+    initial_bearing = math.atan2(x, y)
+
+    # Convert from radians to degrees and normalize
+    initial_bearing = math.degrees(initial_bearing)
+    compass_bearing = (initial_bearing + 360) % 360
+
+    return compass_bearing
+
+def interpolate_points(p1, p2, avg_speed, fluctuations):
+    """
+    Interpolates points between p1 and p2 based on average speed and random fluctuations.
+    
+    :param p1: Dictionary with 'lat', 'lon', 'ele'
+    :param p2: Dictionary with 'lat', 'lon', 'ele'
+    :param avg_speed: Average speed in meters per second
+    :param fluctuations: Maximum fluctuation in speed (e.g., 0.05 for ±5%)
+    :return: List of interpolated points (each as dictionary with 'lat', 'lon', 'ele')
+    """
+    # Calculate the geodesic distance between p1 and p2
+    point1 = (p1['lat'], p1['lon'])
+    point2 = (p2['lat'], p2['lon'])
+    distance = geodesic(point1, point2).meters
+
+    # Apply random fluctuation to the average speed
+    speed = avg_speed * (1 + random.uniform(-fluctuations, fluctuations))
+    
+    # Calculate the number of seconds needed to traverse the distance
+    duration = distance / speed  # in seconds
+    num_seconds = int(duration)
+
+    if num_seconds == 0:
+        num_seconds = 1  # Ensure at least one interpolated point
+
+    # Calculate elevation difference
+    ele_diff = p2['ele'] - p1['ele']
+
+    interpolated_points = []
+    # Calculate initial bearing manually
+    bearing = calculate_initial_compass_bearing(point1, point2)
+    
+    for i in range(1, num_seconds + 1):
+        fraction = i / num_seconds
+        # Calculate the destination point given the bearing and distance
+        interpolated_distance = speed * i  # distance covered after i seconds
+        interpolated_point = geodesic(meters=interpolated_distance).destination(Point(p1['lat'], p1['lon']), bearing)
+        # Interpolate elevation
+        interpolated_ele = p1['ele'] + (ele_diff * fraction)
+        interpolated_points.append({
+            'lat': interpolated_point.latitude,
+            'lon': interpolated_point.longitude,
+            'ele': interpolated_ele
+        })
+    return interpolated_points
+
+def generate_timestamps(num_points, interval_seconds=1, start_time=None):
+    """
+    Generates a list of timestamps.
+    
+    :param num_points: Number of timestamps to generate
+    :param interval_seconds: Seconds between each timestamp
+    :param start_time: Starting datetime object
+    :return: List of datetime objects
+    """
+    if start_time is None:
+        start_time = datetime.datetime.utcnow()
+    return [start_time + datetime.timedelta(seconds=i*interval_seconds) for i in range(num_points)]
+
+def create_gpx(points, timestamps, gpx_filename='route_strava.gpx'):
+    """
+    Creates a GPX file with the given points and timestamps.
+    
+    :param points: List of dictionaries with 'lat', 'lon', 'ele'
+    :param timestamps: List of datetime objects
+    :param gpx_filename: Output GPX file name
+    """
+    NSMAP = {
+        None: "http://www.topografix.com/GPX/1/1",
+        'ns3': "http://www.garmin.com/xmlschemas/TrackPointExtension/v1",
+        'ns2': "http://www.garmin.com/xmlschemas/GpxExtensions/v3",
+        'xsi': "http://www.w3.org/2001/XMLSchema-instance"
+    }
+    
+    # Create root element
+    gpx = etree.Element('gpx', nsmap=NSMAP, version="1.1", creator="Garmin Connect")
+    gpx.set("{http://www.w3.org/2001/XMLSchema-instance}schemaLocation",
+            "http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd "
+            "http://www.garmin.com/xmlschemas/GpxExtensions/v3 http://www.garmin.com/xmlschemas/GpxExtensionsv3.xsd "
+            "http://www.garmin.com/xmlschemas/TrackPointExtension/v1 http://www.garmin.com/xmlschemas/TrackPointExtensionv1.xsd")
+    
+    # Add metadata
+    metadata = etree.SubElement(gpx, 'metadata')
+    link = etree.SubElement(metadata, 'link', href="connect.garmin.com")
+    text = etree.SubElement(link, 'text')
+    text.text = "Garmin Connect"
+    time_elem = etree.SubElement(metadata, 'time')
+    time_elem.text = timestamps[0].isoformat() + 'Z'
+    
+    # Create track
+    trk = etree.SubElement(gpx, 'trk')
+    name = etree.SubElement(trk, 'name')
+    name.text = "Generated Route"
+    trk_type = etree.SubElement(trk, 'type')
+    trk_type.text = "foot_walking"
+    
+    # Create track segment
+    trkseg = etree.SubElement(trk, 'trkseg')
+    
+    # Iterate over points and timestamps to create track points
+    for point, ts in zip(points, timestamps):
+        trkpt = etree.SubElement(trkseg, 'trkpt', lat=f"{point['lat']}", lon=f"{point['lon']}")
+        
+        # Elevation
+        ele = etree.SubElement(trkpt, 'ele')
+        ele.text = f"{point['ele']:.1f}"
+        
+        # Time
+        time_point = etree.SubElement(trkpt, 'time')
+        time_point.text = ts.isoformat() + 'Z'
+        
+        # Extensions
+        extensions = etree.SubElement(trkpt, 'extensions')
+        tpe = etree.SubElement(extensions, '{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}TrackPointExtension')
+        
+        # Temperature (random for demonstration)
+        atemp = etree.SubElement(tpe, '{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}atemp')
+        atemp.text = f"{random.uniform(15.0, 25.0):.1f}"
+        
+        # Cadence (random for demonstration)
+        cad = etree.SubElement(tpe, '{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}cad')
+        cad.text = str(random.randint(60, 100))
+    
+    # Create ElementTree and write to file
+    tree = etree.ElementTree(gpx)
+    tree.write(gpx_filename, pretty_print=True, xml_declaration=True, encoding='UTF-8')
+    print(f'GPX file has been saved as {gpx_filename}')
+
+def main():
+    # Replace with your OpenRouteService API key
+    API_KEY = ''  # Replace with your actual API key
+        
+    # Start coordinates (longitude, latitude)
+    # start_coords = (-73.989308, 40.741895)  # Example: Empire State Building
+    # start_coords = (59.899511, 10.628692) # OOB???
+    start_coords = (10.705898, 59.914428)
+    
+    # Define route length in meters
+    route_length = 5000  # e.g., 5000 meters (5 km)
+    
+    try:
+        # Fetch GPX data for a round trip
+        gpx_data = fetch_round_trip_route(start_coords, API_KEY, route_length)
+        
+        # Parse GPX data to extract coordinates
+        points = parse_gpx(gpx_data)
+        
+        if not points:
+            print('No track points found in the route.')
+            return
+        
+        # Interpolate points for one-second intervals
+        avg_min_per_km = 4
+        seconds_per_km = avg_min_per_km * 60
+        avg_speed = 1000 / seconds_per_km
+        #avg_speed = 1.4  # meters per second
+        fluctuations = 0.05  # ±5%
+        
+        interpolated_points = []
+        for i in range(len(points) - 1):
+            p1 = points[i]
+            p2 = points[i + 1]
+            new_points = interpolate_points(p1, p2, avg_speed, fluctuations)
+            interpolated_points.extend(new_points)
+        
+        if not interpolated_points:
+            print('No interpolated points generated.')
+            return
+        
+        # Generate timestamps (one second apart)
+        start_time = datetime.datetime(2024, 12, 2, 6, 5, 38)  # Example start time
+        timestamps = generate_timestamps(len(interpolated_points), interval_seconds=1, start_time=start_time)
+        
+        if len(timestamps) != len(interpolated_points):
+            print('Mismatch between number of timestamps and interpolated points.')
+            return
+        
+        # Create the GPX file
+        create_gpx(interpolated_points, timestamps, gpx_filename='route_strava.gpx')
+    
+    except Exception as e:
+        print(f'An error occurred: {e}')
+
+if __name__ == "__main__":
+    main()
