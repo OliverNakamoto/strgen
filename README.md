@@ -1,1 +1,1 @@
-# strava-killer
+# strava-gen
